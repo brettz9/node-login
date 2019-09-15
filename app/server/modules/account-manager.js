@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const moment = require('moment');
 const { MongoClient, ObjectID } = require('mongodb');
 
+const PASS_VER = 1;
+
 const isNullish = (o) => o === null || o === undefined;
 
 const guid = function () {
@@ -20,30 +22,43 @@ const guid = function () {
   private encryption & validation methods
 */
 
-const generateSalt = function () {
-  // eslint-disable-next-line max-len
-  const set = '0123456789abcdefghijklmnopqurstuvwxyzABCDEFGHIJKLMNOPQURSTUVWXYZ';
-  let salt = '';
-  for (let i = 0; i < 10; i++) {
-    const p = Math.floor(Math.random() * set.length);
-    salt += set[p];
-  }
-  return salt;
-};
-
 const md5 = function (str) {
   return crypto.createHash('md5').update(str).digest('hex');
 };
 
 const saltAndHash = function (pass, callback) {
-  const salt = generateSalt();
-  callback(salt + md5(pass + salt));
+  const hasher = 'sha256';
+  const iterations = 10000;
+  const hashLength = 32;
+  const saltBytes = 16;
+  crypto.randomBytes(saltBytes, (err, buf) => {
+    if (err) throw err;
+    const salt = buf.toString('hex');
+    crypto.pbkdf2(pass, salt, iterations, hashLength, hasher, (err, derivedKey) => {
+      if (err) throw err;
+      const hash = derivedKey.toString('hex');
+      callback([salt, hash].join('$'));
+    });
+  });
 };
 
-const validatePassword = function (plainPass, hashedPass, callback) {
+const validatePasswordV0 = function (plainPass, hashedPass, callback) {
   const salt = hashedPass.substr(0, 10);
   const validHash = salt + md5(plainPass + salt);
   callback(null, hashedPass === validHash);
+};
+
+const validatePasswordV1 = function (plainPass, hashedPass, callback) {
+  const hasher = 'sha256';
+  const iterations = 10000;
+  const hashLength = 32;
+  const salt = hashedPass.split('$')[0];
+  crypto.pbkdf2(plainPass, salt, iterations, hashLength, hasher, (err, derivedKey) => {
+    if (err) throw err;
+    const plainPassHash = derivedKey.toString('hex');
+    const validHash = [salt, plainPassHash].join('$');
+    callback(null, hashedPass === validHash);
+  });
 };
 
 const getObjectId = function (id) {
@@ -105,15 +120,27 @@ class AccountManager {
       if (isNullish(o)) {
         callback('user-not-found');
       } else {
-        validatePassword(pass, o.pass, (err, res) => {
-          if (err) {
-            callback(err.message);
-          } else if (res) {
-            callback(null, o);
-          } else {
-            callback('invalid-password');
-          }
-        });
+        if (!o.pass_ver || o.pass_ver === 0) {
+          validatePasswordV0(pass, o.pass, (err, res) => {
+            if (err) {
+              callback(err.message);
+            } else if (res) {
+              callback(null, o);
+            } else {
+              callback('invalid-password');
+            }
+          });
+        } else if (o.pass_ver === 1) {
+          validatePasswordV1(pass, o.pass, (err, res) => {
+            if (err) {
+              callback(err.message);
+            } else if (res) {
+              callback(null, o);
+            }	else {
+              callback('invalid-password');
+            }
+          });
+        }
       }
     });
   }
@@ -166,6 +193,7 @@ class AccountManager {
           } else {
             saltAndHash(newData.pass, (hash) => {
               newData.pass = hash;
+              newData.pass_ver = PASS_VER;
               // append date stamp when record was created
               newData.date = moment().format('MMMM Do YYYY, h:mm:ss a');
               this.accounts.insertOne(newData, callback);
@@ -183,11 +211,14 @@ class AccountManager {
         email: data.email,
         country: data.country
       };
-      if (data.pass) o.pass = data.pass;
+      if (data.pass) {
+        o.pass = data.pass;
+        o.pass_ver = PASS_VER;
+      }
       this.accounts.findOneAndUpdate(
         { _id: getObjectId(data.id) },
         { $set: o },
-        { returnOriginal: false },
+        { upsert: true, returnOriginal: false },
         callback
       );
     };
@@ -205,8 +236,8 @@ class AccountManager {
     saltAndHash(newPass, (hash) => {
       newPass = hash;
       this.accounts.findOneAndUpdate({ passKey }, {
-        $set: { pass: newPass }, $unset: { passKey: '' }
-      }, { returnOriginal: false }, callback);
+        $set: { pass: newPass, pass_ver: PASS_VER }, $unset: { passKey: '' }
+      }, { upsert: true, returnOriginal: false }, callback);
     });
   }
 
